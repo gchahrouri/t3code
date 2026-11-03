@@ -2,6 +2,7 @@ import {
   ClientSettingsSchema,
   type ClientSettingsPatch,
   type EnvironmentId,
+  type ModelSelection,
   globalIdleCompaction,
   idleCompactionPatch,
   isNullableProjectSettingsOverride,
@@ -13,6 +14,8 @@ import {
   ServerSettings,
   type T3ProjectFile,
   type ServerSettingsPatch,
+  type ServerProvider,
+  resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import {
@@ -25,6 +28,11 @@ import * as Equal from "effect/Equal";
 import * as Cause from "effect/Cause";
 
 import type { ResolvedSettingsScope } from "./settingsScope";
+import {
+  resolveScopedModelProvider,
+  SCOPED_MODEL_SETTING_KEYS,
+  scopedModelSelectionsEqual,
+} from "./scopedModelSelection";
 
 export type ScopedSettingsPatch = ServerSettingsPatch & ClientSettingsPatch;
 
@@ -126,14 +134,31 @@ export function resolveScopedSettingsTargets(
 }
 
 export function scopedSettingsAreMixed(
-  targets: readonly Pick<ScopedSettingsTarget, "settings">[],
+  targets: readonly (Pick<ScopedSettingsTarget, "settings"> &
+    Partial<Pick<ScopedSettingsTarget, "environmentId">>)[],
   keys: readonly (keyof ServerSettings)[],
+  providersByEnvironment?: ReadonlyMap<EnvironmentId, readonly ServerProvider[]>,
 ): boolean {
   const first = targets[0];
   return (
     first !== undefined &&
     targets.some((candidate) =>
-      keys.some((key) => !Equal.equals(first.settings[key], candidate.settings[key])),
+      keys.some((key) => {
+        if (
+          providersByEnvironment &&
+          first.environmentId &&
+          candidate.environmentId &&
+          SCOPED_MODEL_SETTING_KEYS.some((modelKey) => modelKey === key)
+        ) {
+          return !scopedModelSelectionsEqual(
+            first.settings[key] as ModelSelection | null,
+            providersByEnvironment.get(first.environmentId) ?? [],
+            candidate.settings[key] as ModelSelection | null,
+            providersByEnvironment.get(candidate.environmentId) ?? [],
+          );
+        }
+        return !Equal.equals(first.settings[key], candidate.settings[key]);
+      }),
     )
   );
 }
@@ -221,6 +246,10 @@ export function planScopedSettingsPatch(
   scope: ResolvedSettingsScope,
   environments: readonly ScopedSettingsEnvironment[],
   patch: ScopedSettingsPatch,
+  modelContext?: {
+    readonly sourceEnvironmentId: EnvironmentId;
+    readonly providersByEnvironment: ReadonlyMap<EnvironmentId, readonly ServerProvider[]>;
+  },
 ) {
   const clientPatch = Object.fromEntries(
     Object.entries(patch).filter(([key]) => CLIENT_KEYS.has(key) && !SERVER_KEYS.has(key)),
@@ -234,7 +263,7 @@ export function planScopedSettingsPatch(
   const unscopableKeys = isProjectScope
     ? serverKeys.filter((key) => !isProjectScopedSettingKey(key))
     : [];
-  const serverWrites: ScopedServerWrite[] =
+  let serverWrites: ScopedServerWrite[] =
     serverKeys.length === 0
       ? []
       : isProjectScope
@@ -319,6 +348,69 @@ export function planScopedSettingsPatch(
               ];
             })
           : [];
+  const modelKeys = SCOPED_MODEL_SETTING_KEYS.filter((key) => patch[key]?.instanceId !== undefined);
+  if (modelContext && modelKeys.length > 0) {
+    const sourceProviders =
+      modelContext.providersByEnvironment.get(modelContext.sourceEnvironmentId) ?? [];
+    const mappedWrites: ScopedServerWrite[] = [];
+    for (const write of serverWrites) {
+      const destinationProviders =
+        modelContext.providersByEnvironment.get(write.environmentId) ?? [];
+      const remap = <T extends ServerSettingsPatch | ProjectSettingsOverrides>(
+        value: T,
+        projectId: ProjectId | null,
+      ): T | null => {
+        const mapped = { ...value };
+        for (const key of modelKeys) {
+          const selection = (value as ServerSettingsPatch)[key];
+          if (!selection?.instanceId) continue;
+          const source = sourceProviders.find(
+            (provider) => provider.instanceId === selection.instanceId,
+          );
+          const destination = source
+            ? resolveScopedModelProvider(source, destinationProviders)
+            : null;
+          if (
+            !destination ||
+            (destination.instanceId !== selection.instanceId &&
+              (destination.availability === "unavailable" ||
+                !resolveProjectProviderInstanceEnabled(
+                  write.previous,
+                  projectId,
+                  destination.instanceId,
+                )))
+          )
+            return null;
+          Object.assign(mapped, { [key]: { ...selection, instanceId: destination.instanceId } });
+        }
+        return mapped;
+      };
+      const overrides = write.patch.projectSettingsOverrides;
+      let mapped = remap(write.patch, null);
+      if (mapped && overrides) {
+        const next = { ...overrides };
+        for (const [id, override] of Object.entries(overrides)) {
+          if (override === null) continue;
+          const mappedOverride = remap(override, id as ProjectId);
+          if (!mappedOverride) {
+            mapped = null;
+            break;
+          }
+          next[id as ProjectId] = mappedOverride;
+        }
+        if (mapped) mapped = { ...mapped, projectSettingsOverrides: next };
+      }
+      if (!mapped)
+        return {
+          clientPatch,
+          hasClientWrite: false,
+          serverWrites: [],
+          unavailableReason: `The selected account is unavailable or ambiguous on ${write.label}. Select that environment to choose its account separately.`,
+        };
+      mappedWrites.push({ ...write, patch: mapped });
+    }
+    serverWrites = mappedWrites;
+  }
   const hasClientWrite = Object.keys(clientPatch).length > 0;
   const hasWrite = hasClientWrite || serverWrites.length > 0;
   const unavailableReason =

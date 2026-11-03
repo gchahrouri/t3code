@@ -9,6 +9,7 @@ import {
 } from "../../providerInstances";
 import { useEnvironmentProviders, useEnvironments } from "../../state/environments";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { resolveScopedModelProvider } from "./scopedModelSelection";
 
 export function useScopedModelDisabledReason(
   settings: UnifiedSettings,
@@ -25,15 +26,18 @@ export function useScopedModelDisabledReason(
       );
       const providers = providersByEnvironment.get(candidate.environmentId);
       if (!environment?.serverConfig || !providers) continue;
+      const mappedProvider = sourceEntry
+        ? resolveScopedModelProvider(sourceEntry.snapshot, providers)
+        : null;
       const entry = applyProviderInstanceSettings(
         deriveProviderInstanceEntries(providers),
         candidate.settings,
         candidate.projectId,
-      ).find((option) => option.instanceId === instanceId);
+      ).find((option) => option.instanceId === mappedProvider?.instanceId);
       const options = getCustomModelOptionsByInstance(
         mergeEnvironmentSettings(candidate.settings, settings),
         providers,
-      ).get(instanceId);
+      ).get(mappedProvider?.instanceId ?? instanceId);
       if (
         !entry?.enabled ||
         !entry.isAvailable ||

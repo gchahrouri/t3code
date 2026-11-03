@@ -4,6 +4,8 @@ import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
+  ProviderDriverKind,
+  type ServerProvider,
   type ServerSettings,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -100,6 +102,114 @@ const checkout = resolveSettingsScope(
   [group],
   environments,
 );
+
+describe("scoped model accounts", () => {
+  const sourceId = ProviderInstanceId.make("codex_laptop_gmail");
+  const remoteId = ProviderInstanceId.make("codex_server_gmail");
+  const selection = {
+    instanceId: sourceId,
+    model: "gpt-6-luna",
+    options: [{ id: "reasoningEffort", value: "low" }],
+  } as const;
+  const accountEnvironments = [
+    environment("Laptop", {
+      settings: {
+        providerInstances: {
+          [sourceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+        },
+      },
+    }),
+    environment("Server", {
+      settings: {
+        providerInstances: {
+          [remoteId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+          [ProviderInstanceId.make("codex_duplicate")]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+          },
+        },
+      },
+    }),
+  ];
+  const account = (
+    instanceId: ProviderInstanceId,
+    email = "gmail@example.test",
+  ): ServerProvider => ({
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    enabled: true,
+    installed: true,
+    status: "ready",
+    version: null,
+    checkedAt: "2026-11-03T00:00:00.000Z",
+    auth: { status: "authenticated", type: "chatgpt", email, workspaceId: "personal" },
+    models: [{ slug: "gpt-6-luna", name: "Luna", isCustom: false, capabilities: {} }],
+    slashCommands: [],
+    skills: [],
+  });
+  const context = (remote: readonly ServerProvider[]) => ({
+    sourceEnvironmentId: laptop.environmentId,
+    providersByEnvironment: new Map([
+      [laptop.environmentId, [account(sourceId)]],
+      [server.environmentId, remote],
+    ]),
+  });
+
+  it("saves each machine's local ID for the same signed-in account", () => {
+    const plan = planScopedSettingsPatch(
+      all,
+      accountEnvironments,
+      { textGenerationModelSelection: selection },
+      context([account(remoteId)]),
+    );
+    expect(plan.unavailableReason).toBeNull();
+    expect(plan.serverWrites.map((write) => write.patch.textGenerationModelSelection)).toEqual([
+      selection,
+      { ...selection, instanceId: remoteId },
+    ]);
+  });
+
+  it("maps project overrides without changing the provider registry", () => {
+    const plan = planScopedSettingsPatch(
+      project,
+      accountEnvironments,
+      { defaultModelSelection: selection },
+      context([account(remoteId)]),
+    );
+    expect(plan.unavailableReason).toBeNull();
+    expect(
+      plan.serverWrites.find((write) => write.environmentId === server.environmentId)?.patch,
+    ).toEqual({
+      projectSettingsOverrides: {
+        [projectId]: {
+          defaultModelSelection: {
+            ...selection,
+            instanceId: remoteId,
+          },
+        },
+      },
+    });
+  });
+
+  it.each([
+    ["another account", [account(remoteId, "other@example.test")]],
+    ["duplicate matches", [account(remoteId), account(ProviderInstanceId.make("codex_duplicate"))]],
+    [
+      "another workspace",
+      [{ ...account(remoteId), auth: { ...account(remoteId).auth, workspaceId: "work" } }],
+    ],
+    ["an unverified account", [{ ...account(remoteId), auth: { status: "unknown" } }]],
+  ] as const)("rejects %s before saving to any machine", (_name, remote) => {
+    const plan = planScopedSettingsPatch(
+      all,
+      accountEnvironments,
+      { textGenerationModelSelection: selection },
+      context(remote),
+    );
+    expect(plan.unavailableReason).toContain("Server");
+    expect(plan.serverWrites).toEqual([]);
+  });
+});
 
 describe("scoped settings targets", () => {
   it("uses the named environment even when a different primary is available", () => {
